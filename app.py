@@ -1,121 +1,96 @@
 import streamlit as st
 import cv2
-import pandas as pd
-import time
-from collections import deque, Counter
+import numpy as np
 from deepface import DeepFace
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+import av
 
-# ------------------ PAGE CONFIG ------------------
+# ==============================
+# PAGE CONFIG
+# ==============================
 st.set_page_config(
-    page_title="Emotion AI Dashboard",
-    page_icon="😊",
+    page_title="Emotion AI",
+    page_icon="🎭",
     layout="wide"
 )
 
-# ------------------ CUSTOM CSS ------------------
-st.markdown("""
-<style>
-body { background-color: #0e1117; }
-.block-container { padding: 2rem 3rem; }
+st.title("🎭 Emotion Detection AI")
 
-h1, h2, h3 { color: #00ffcc; }
+# ==============================
+# DEVICE DETECTION
+# ==============================
+user_agent = st.request.headers.get("User-Agent", "").lower()
 
-.card {
-    background-color: #1c1f26;
-    padding: 20px;
-    border-radius: 15px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-}
+is_mobile = any(x in user_agent for x in ["iphone", "android", "ipad"])
 
-.stButton > button {
-    background-color: #00ffcc;
-    color: black;
-    border-radius: 10px;
-    padding: 8px 16px;
-}
+# ==============================
+# MODE SELECTION
+# ==============================
+if is_mobile:
+    st.info("📱 Mobile detected → Using Image Upload Mode")
+    mode = "Upload Image"
+else:
+    mode = st.radio("Select Mode", ["Live Camera", "Upload Image"])
 
-hr { border: 1px solid #2a2d34; }
-</style>
-""", unsafe_allow_html=True)
+# ==============================
+# IMAGE UPLOAD MODE
+# ==============================
+if mode == "Upload Image":
 
-# ------------------ HEADER ------------------
-st.title("😊 Real-Time Emotion Detection Dashboard")
-st.markdown("---")
+    uploaded_file = st.file_uploader(
+        "Upload an image",
+        type=["jpg", "jpeg", "png"]
+    )
 
-# ------------------ SESSION STATE ------------------
-if "run" not in st.session_state:
-    st.session_state.run = False
+    if uploaded_file is not None:
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, 1)
 
-if "emotion_data" not in st.session_state:
-    st.session_state.emotion_data = []
+        st.image(img, caption="Uploaded Image", use_container_width=True)
 
-if "emotion_history" not in st.session_state:
-    st.session_state.emotion_history = deque(maxlen=5)
+        with st.spinner("Analyzing emotion..."):
+            try:
+                result = DeepFace.analyze(
+                    img,
+                    actions=['emotion'],
+                    enforce_detection=False
+                )
 
-# ------------------ BUTTONS ------------------
-col_btn1, col_btn2 = st.columns(2)
+                if isinstance(result, list):
+                    result = result[0]
 
-with col_btn1:
-    if st.button("▶ Start Camera"):
-        st.session_state.run = True
-        st.session_state.emotion_history.clear()
+                emotion = result["dominant_emotion"]
+                confidence = max(result["emotion"].values())
 
-with col_btn2:
-    if st.button("⏹ Stop Camera"):
-        st.session_state.run = False
+                st.success(f"Emotion: {emotion} ({confidence:.1f}%)")
 
-# ------------------ LAYOUT ------------------
-left, right = st.columns([2, 1])
+            except Exception:
+                st.error("❌ Could not detect face clearly. Try another image.")
 
-frame_placeholder = left.empty()
+# ==============================
+# LIVE CAMERA MODE
+# ==============================
+elif mode == "Live Camera":
 
-# ------------------ EMOJI MAP ------------------
-emoji_dict = {
-    "angry": "😠", "disgust": "🤢", "fear": "😨",
-    "happy": "😄", "neutral": "😐",
-    "sad": "😢", "surprise": "😲"
-}
+    st.info("💻 Desktop mode → Live Camera Active")
 
-# ------------------ FACE DETECTOR ------------------
-face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+    class EmotionDetector(VideoTransformerBase):
+        def __init__(self):
+            self.frame_count = 0
+            self.last_emotion = ""
+            self.last_confidence = 0
 
-if face_cascade.empty():
-    st.error("Cascade file not found")
-    st.stop()
+        def transform(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            self.frame_count += 1
 
-# ------------------ CAMERA ------------------
-current_emotion = "neutral"
-confidence = 0
-
-if st.session_state.run:
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        st.error("Camera not working")
-        st.stop()
-
-    prev_time = 0
-    frame_count = 0
-    cached_emotion = "neutral"
-    cached_confidence = 0
-
-    while st.session_state.run:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
-
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,255), 2)
-
-            face_roi = frame[y:y+h, x:x+w]
-
-            if frame_count % 3 == 0:
+            # 🔥 Analyze every 5th frame (performance boost)
+            if self.frame_count % 5 == 0:
                 try:
+                    small_img = cv2.resize(img, (224, 224))
+
                     result = DeepFace.analyze(
-                        face_roi,
+                        small_img,
                         actions=['emotion'],
                         enforce_detection=False
                     )
@@ -123,92 +98,27 @@ if st.session_state.run:
                     if isinstance(result, list):
                         result = result[0]
 
-                    emotion = result["dominant_emotion"]
-                    conf = max(result["emotion"].values())
+                    self.last_emotion = result["dominant_emotion"]
+                    self.last_confidence = max(result["emotion"].values())
 
-                    st.session_state.emotion_history.append(emotion)
-
-                    if conf > 80:
-                        cached_emotion = emotion
-                    else:
-                        cached_emotion = Counter(st.session_state.emotion_history).most_common(1)[0][0]
-
-                    cached_confidence = conf
-
-                except:
+                except Exception:
                     pass
 
-            current_emotion = cached_emotion
-            confidence = cached_confidence
+            # Draw last known result
+            if self.last_emotion:
+                cv2.putText(
+                    img,
+                    f"{self.last_emotion} ({self.last_confidence:.1f}%)",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 0),
+                    2
+                )
 
-            cv2.putText(frame, f"{current_emotion} ({confidence:.1f})",
-                        (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+            return img
 
-            st.session_state.emotion_data.append({
-                "time": time.strftime("%H:%M:%S"),
-                "emotion": current_emotion,
-                "confidence": confidence
-            })
-
-            if len(st.session_state.emotion_data) > 100:
-                st.session_state.emotion_data.pop(0)
-
-        frame_count += 1
-
-        # FPS
-        current_time = time.time()
-        fps = 1 / (current_time - prev_time) if prev_time else 0
-        prev_time = current_time
-
-        cv2.putText(frame, f"FPS: {int(fps)}", (20,30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-
-        frame_placeholder.image(frame, channels="BGR")
-        time.sleep(0.03)
-
-    cap.release()
-
-# ------------------ ANALYTICS ------------------
-if len(st.session_state.emotion_data) > 0:
-    df = pd.DataFrame(st.session_state.emotion_data)
-
-    dominant = df["emotion"].mode()[0]
-
-    # TOP METRICS
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Current Emotion", f"{current_emotion} {emoji_dict.get(current_emotion,'')}")
-    col2.metric("Confidence", f"{confidence:.1f}%")
-    col3.metric("Dominant Emotion", f"{dominant} {emoji_dict.get(dominant,'')}")
-
-    st.markdown("---")
-
-    # LEFT SIDE
-    with left:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("📊 Emotion Distribution")
-        st.bar_chart(df["emotion"].value_counts())
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("📈 Emotion Timeline")
-        st.line_chart(df["confidence"])
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # RIGHT SIDE
-    with right:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("💡 AI Suggestion")
-
-        if dominant in ["sad", "fear"]:
-            st.warning("You seem stressed 😟")
-        elif dominant == "angry":
-            st.warning("You look angry 😡")
-        elif dominant == "happy":
-            st.success("You look happy 😄")
-        else:
-            st.info("You look neutral 😐")
-
-        st.markdown("</div>", unsafe_allow_html=True)
+    webrtc_streamer(
+        key="emotion-detection",
+        video_transformer_factory=EmotionDetector
+    )
