@@ -1,102 +1,164 @@
-import streamlit as st
+﻿"""
+EmoVision â€” AI Face Emotion Detection System
+Backend: FastAPI + WebSockets + DeepFace + Custom Model
+"""
+
+import base64
+import io
+import json
+import time
+import traceback
+from pathlib import Path
+
 import cv2
 import numpy as np
-import pandas as pd
-import time
-from deepface import DeepFace
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
-import av
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
-# ------------------ PAGE ------------------
-st.set_page_config(page_title="Emotion AI Live", layout="wide")
-st.title("🎥 Live Emotion Detection")
+from engine.pipeline import EmotionPipeline
 
-# ------------------ SESSION ------------------
-if "emotion_data" not in st.session_state:
-    st.session_state.emotion_data = []
-
-# ------------------ VIDEO PROCESSOR ------------------
-class EmotionProcessor(VideoProcessorBase):
-
-    def __init__(self):
-        self.last_emotion = "neutral"
-        self.last_conf = 0
-
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-
-        try:
-            result = DeepFace.analyze(
-                img,
-                actions=['emotion'],
-                enforce_detection=False
-            )
-
-            if isinstance(result, list):
-                result = result[0]
-
-            emotion = result["dominant_emotion"]
-            confidence = max(result["emotion"].values())
-
-            self.last_emotion = emotion
-            self.last_conf = confidence
-
-            # Store data
-            st.session_state.emotion_data.append({
-                "time": time.strftime("%H:%M:%S"),
-                "emotion": emotion,
-                "confidence": confidence
-            })
-
-        except:
-            pass
-
-        # Display text
-        cv2.putText(img, f"{self.last_emotion} ({self.last_conf:.1f})",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0,255,0), 2)
-
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-# ------------------ START STREAM ------------------
-webrtc_ctx = webrtc_streamer(
-    key="emotion",
-    video_processor_factory=EmotionProcessor
+# â”€â”€â”€ App Setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app = FastAPI(
+    title="EmoVision API",
+    description="Real-time face emotion detection powered by deep learning",
+    version="2.0.0",
 )
 
-# ------------------ ANALYTICS ------------------
-if len(st.session_state.emotion_data) > 0:
-    df = pd.DataFrame(st.session_state.emotion_data)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    dominant = df["emotion"].mode()[0]
+# Mount static files (our frontend)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-    st.markdown("---")
+# â”€â”€â”€ Load ML Pipeline (once at startup) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+pipeline = EmotionPipeline()
 
-    col1, col2, col3 = st.columns(3)
 
-    col1.metric("Current Emotion", dominant)
-    col2.metric("Samples", len(df))
-    col3.metric("Dominant Emotion", dominant)
+# â”€â”€â”€ Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main frontend SPA."""
+    html_path = Path("static/index.html")
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"), status_code=200)
 
-    st.markdown("---")
 
-    left, right = st.columns([2, 1])
+@app.post("/api/analyze")
+async def analyze_image(file: UploadFile = File(...)):
+    """
+    Analyze an uploaded image for facial emotions.
+    Returns: list of detected faces with emotion scores, bounding boxes,
+             landmarks, dominant emotion, and annotated image as base64.
+    """
+    try:
+        # Read uploaded image
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    with left:
-        st.subheader("📊 Distribution")
-        st.bar_chart(df["emotion"].value_counts())
+        if img_bgr is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Could not decode image. Please upload a valid JPG/PNG."},
+            )
 
-        st.subheader("📈 Confidence")
-        st.line_chart(df["confidence"])
+        start = time.perf_counter()
+        results = pipeline.analyze(img_bgr)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
 
-    with right:
-        st.subheader("💡 Suggestion")
+        # Draw annotations on a copy of the image
+        annotated = pipeline.draw_annotations(img_bgr.copy(), results)
 
-        if dominant in ["sad", "fear"]:
-            st.warning("You seem stressed 😟")
-        elif dominant == "angry":
-            st.warning("You look angry 😡")
-        elif dominant == "happy":
-            st.success("You look happy 😄")
-        else:
-            st.info("You look neutral 😐")
+        # Encode annotated image as base64 for frontend
+        _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        annotated_b64 = base64.b64encode(buffer).decode("utf-8")
+
+        return {
+            "success": True,
+            "inference_ms": elapsed_ms,
+            "face_count": len(results),
+            "faces": results,
+            "annotated_image": f"data:image/jpeg;base64,{annotated_b64}",
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)},
+        )
+
+
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time camera emotion detection.
+    Client sends base64 JPEG frames, server responds with JSON results.
+
+    Protocol:
+      Client â†’ Server: base64 encoded JPEG string
+      Server â†’ Client: JSON { faces: [...], inference_ms: float, fps: float }
+    """
+    await websocket.accept()
+    frame_times = []
+
+    try:
+        while True:
+            # Receive frame from browser
+            data = await websocket.receive_text()
+
+            frame_start = time.perf_counter()
+
+            # Decode base64 â†’ OpenCV image
+            if data.startswith("data:image"):
+                data = data.split(",", 1)[1]
+
+            img_bytes = base64.b64decode(data)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                continue
+
+            # Run inference
+            results = pipeline.analyze(frame, fast_mode=True)
+            elapsed_ms = round((time.perf_counter() - frame_start) * 1000, 1)
+
+            # Rolling FPS calculation
+            frame_times.append(time.perf_counter())
+            frame_times = [t for t in frame_times if time.perf_counter() - t < 2.0]
+            fps = round(len(frame_times) / 2.0, 1)
+
+            await websocket.send_json({
+                "faces": results,
+                "inference_ms": elapsed_ms,
+                "fps": fps,
+                "face_count": len(results),
+            })
+
+    except WebSocketDisconnect:
+        print("Client disconnected from WebSocket stream.")
+    except Exception as e:
+        traceback.print_exc()
+        await websocket.send_json({"error": str(e)})
+
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "model": pipeline.model_info(),
+        "version": "2.0.0",
+    }
+
+
+# â”€â”€â”€ Entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
