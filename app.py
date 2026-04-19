@@ -1,7 +1,8 @@
 import streamlit as st
-import numpy as np
+import cv2
 import pandas as pd
-from PIL import Image
+import time
+from collections import deque, Counter
 from deepface import DeepFace
 
 # ------------------ PAGE CONFIG ------------------
@@ -14,227 +15,200 @@ st.set_page_config(
 # ------------------ CUSTOM CSS ------------------
 st.markdown("""
 <style>
-body {
-    background-color: #0e1117;
-}
-.block-container {
-    padding: 2rem 3rem;
-}
-h1, h2, h3 {
-    color: #00ffcc;
-}
+body { background-color: #0e1117; }
+.block-container { padding: 2rem 3rem; }
+
+h1, h2, h3 { color: #00ffcc; }
+
 .card {
     background-color: #1c1f26;
     padding: 20px;
     border-radius: 15px;
     box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    margin-bottom: 1rem;
 }
+
 .stButton > button {
     background-color: #00ffcc;
     color: black;
     border-radius: 10px;
     padding: 8px 16px;
 }
-hr {
-    border: 1px solid #2a2d34;
-}
-.small-text {
-    color: #aab3c5;
-    font-size: 0.95rem;
-}
+
+hr { border: 1px solid #2a2d34; }
 </style>
 """, unsafe_allow_html=True)
 
-# ------------------ SESSION STATE ------------------
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-# ------------------ LABELS / EMOJIS ------------------
-emoji_dict = {
-    "angry": "😠",
-    "disgust": "🤢",
-    "fear": "😨",
-    "happy": "😄",
-    "neutral": "😐",
-    "sad": "😢",
-    "surprise": "😲"
-}
-
-# ------------------ HELPERS ------------------
-def analyze_emotion(pil_image: Image.Image):
-    img = np.array(pil_image.convert("RGB"))
-
-    result = DeepFace.analyze(
-        img_path=img,
-        actions=["emotion"],
-        enforce_detection=False
-    )
-
-    if isinstance(result, list):
-        result = result[0]
-
-    dominant_emotion = result["dominant_emotion"]
-    emotion_scores = result["emotion"]
-    confidence = float(max(emotion_scores.values()))
-
-    return dominant_emotion, confidence, emotion_scores
-
-
-def add_to_history(emotion: str, confidence: float):
-    st.session_state.history.append(
-        {
-            "emotion": emotion,
-            "confidence": round(confidence, 2)
-        }
-    )
-    if len(st.session_state.history) > 50:
-        st.session_state.history.pop(0)
-
-
 # ------------------ HEADER ------------------
-st.title("😊 Emotion Detection AI Dashboard")
-st.markdown("### Clean website version: mobile-friendly and browser-friendly")
+st.title("😊 Real-Time Emotion Detection Dashboard")
 st.markdown("---")
 
-# ------------------ INPUT MODE ------------------
-mode = st.radio(
-    "Choose Input Method",
-    ["Upload Image", "Take Photo"],
-    horizontal=True
-)
+# ------------------ SESSION STATE ------------------
+if "run" not in st.session_state:
+    st.session_state.run = False
 
-image_source = None
+if "emotion_data" not in st.session_state:
+    st.session_state.emotion_data = []
 
-if mode == "Upload Image":
-    uploaded_file = st.file_uploader(
-        "Upload an image",
-        type=["jpg", "jpeg", "png"]
-    )
-    if uploaded_file is not None:
-        image_source = Image.open(uploaded_file)
+if "emotion_history" not in st.session_state:
+    st.session_state.emotion_history = deque(maxlen=5)
 
-elif mode == "Take Photo":
-    captured_file = st.camera_input("Take a photo")
-    if captured_file is not None:
-        image_source = Image.open(captured_file)
+# ------------------ BUTTONS ------------------
+col_btn1, col_btn2 = st.columns(2)
 
-# ------------------ MAIN LAYOUT ------------------
-left, right = st.columns([2, 1], gap="large")
+with col_btn1:
+    if st.button("▶ Start Camera"):
+        st.session_state.run = True
+        st.session_state.emotion_history.clear()
 
-current_emotion = None
-current_confidence = None
-emotion_scores = None
+with col_btn2:
+    if st.button("⏹ Stop Camera"):
+        st.session_state.run = False
 
-with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📷 Input Preview")
+# ------------------ LAYOUT ------------------
+left, right = st.columns([2, 1])
 
-    if image_source is not None:
-        st.image(image_source, caption="Selected Image", use_container_width=True)
+frame_placeholder = left.empty()
 
-        with st.spinner("Analyzing emotion..."):
-            try:
-                current_emotion, current_confidence, emotion_scores = analyze_emotion(image_source)
-                add_to_history(current_emotion, current_confidence)
-                st.success(
-                    f"Detected Emotion: {current_emotion.upper()} {emoji_dict.get(current_emotion, '')} "
-                    f"({current_confidence:.1f}%)"
-                )
-            except Exception:
-                st.error("Could not analyze the image clearly. Try another face image.")
-    else:
-        st.info("Upload an image or take a photo to begin.")
+# ------------------ EMOJI MAP ------------------
+emoji_dict = {
+    "angry": "😠", "disgust": "🤢", "fear": "😨",
+    "happy": "😄", "neutral": "😐",
+    "sad": "😢", "surprise": "😲"
+}
 
-    st.markdown('</div>', unsafe_allow_html=True)
+# ------------------ FACE DETECTOR ------------------
+face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
 
-    if emotion_scores is not None:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("📊 Emotion Probability Distribution")
+if face_cascade.empty():
+    st.error("Cascade file not found")
+    st.stop()
 
-        prob_df = pd.DataFrame(
-            {
-                "Emotion": list(emotion_scores.keys()),
-                "Confidence": list(emotion_scores.values())
-            }
-        ).sort_values("Confidence", ascending=False)
+# ------------------ CAMERA ------------------
+current_emotion = "neutral"
+confidence = 0
 
-        st.bar_chart(prob_df.set_index("Emotion"))
-        st.markdown('</div>', unsafe_allow_html=True)
+if st.session_state.run:
+    cap = cv2.VideoCapture(0)
 
-with right:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📌 Current Result")
+    if not cap.isOpened():
+        st.error("Camera not working")
+        st.stop()
 
-    if current_emotion is not None:
-        st.metric(
-            "Current Emotion",
-            f"{current_emotion.capitalize()} {emoji_dict.get(current_emotion, '')}"
-        )
-        st.metric(
-            "Confidence",
-            f"{current_confidence:.1f}%"
-        )
-    else:
-        st.markdown('<p class="small-text">No analysis yet.</p>', unsafe_allow_html=True)
+    prev_time = 0
+    frame_count = 0
+    cached_emotion = "neutral"
+    cached_confidence = 0
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    while st.session_state.run:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("💡 AI Suggestion")
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
 
-    if current_emotion in ["sad", "fear"]:
-        st.warning("You seem stressed. Take a short break and breathe slowly.")
-    elif current_emotion == "angry":
-        st.warning("You look tense. Try pausing and relaxing for a moment.")
-    elif current_emotion == "happy":
-        st.success("You seem happy. Keep smiling! 😄")
-    elif current_emotion == "surprise":
-        st.info("You look surprised. Stay calm and focused.")
-    elif current_emotion == "neutral":
-        st.info("You look neutral and composed.")
-    elif current_emotion == "disgust":
-        st.warning("You seem uncomfortable. Consider adjusting the environment.")
-    else:
-        st.markdown('<p class="small-text">Suggestions will appear after analysis.</p>', unsafe_allow_html=True)
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,255), 2)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+            face_roi = frame[y:y+h, x:x+w]
 
-# ------------------ HISTORY / ANALYTICS ------------------
-if st.session_state.history:
-    history_df = pd.DataFrame(st.session_state.history)
-    dominant = history_df["emotion"].mode()[0]
+            if frame_count % 3 == 0:
+                try:
+                    result = DeepFace.analyze(
+                        face_roi,
+                        actions=['emotion'],
+                        enforce_detection=False
+                    )
+
+                    if isinstance(result, list):
+                        result = result[0]
+
+                    emotion = result["dominant_emotion"]
+                    conf = max(result["emotion"].values())
+
+                    st.session_state.emotion_history.append(emotion)
+
+                    if conf > 80:
+                        cached_emotion = emotion
+                    else:
+                        cached_emotion = Counter(st.session_state.emotion_history).most_common(1)[0][0]
+
+                    cached_confidence = conf
+
+                except:
+                    pass
+
+            current_emotion = cached_emotion
+            confidence = cached_confidence
+
+            cv2.putText(frame, f"{current_emotion} ({confidence:.1f})",
+                        (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+            st.session_state.emotion_data.append({
+                "time": time.strftime("%H:%M:%S"),
+                "emotion": current_emotion,
+                "confidence": confidence
+            })
+
+            if len(st.session_state.emotion_data) > 100:
+                st.session_state.emotion_data.pop(0)
+
+        frame_count += 1
+
+        # FPS
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if prev_time else 0
+        prev_time = current_time
+
+        cv2.putText(frame, f"FPS: {int(fps)}", (20,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+
+        frame_placeholder.image(frame, channels="BGR")
+        time.sleep(0.03)
+
+    cap.release()
+
+# ------------------ ANALYTICS ------------------
+if len(st.session_state.emotion_data) > 0:
+    df = pd.DataFrame(st.session_state.emotion_data)
+
+    dominant = df["emotion"].mode()[0]
+
+    # TOP METRICS
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Current Emotion", f"{current_emotion} {emoji_dict.get(current_emotion,'')}")
+    col2.metric("Confidence", f"{confidence:.1f}%")
+    col3.metric("Dominant Emotion", f"{dominant} {emoji_dict.get(dominant,'')}")
 
     st.markdown("---")
-    c1, c2, c3 = st.columns(3)
 
-    c1.metric(
-        "Dominant Emotion",
-        f"{dominant.capitalize()} {emoji_dict.get(dominant, '')}"
-    )
-    c2.metric(
-        "Total Analyses",
-        str(len(history_df))
-    )
-    c3.metric(
-        "Average Confidence",
-        f"{history_df['confidence'].mean():.1f}%"
-    )
+    # LEFT SIDE
+    with left:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("📊 Emotion Distribution")
+        st.bar_chart(df["emotion"].value_counts())
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📈 Analysis History")
-    st.dataframe(history_df.tail(10), use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📉 Emotion Distribution Over Session")
-    st.bar_chart(history_df["emotion"].value_counts())
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("📈 Emotion Timeline")
+        st.line_chart(df["confidence"])
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    csv_data = history_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "💾 Download Results CSV",
-        data=csv_data,
-        file_name="emotion_results.csv",
-        mime="text/csv"
-    )
+    # RIGHT SIDE
+    with right:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("💡 AI Suggestion")
+
+        if dominant in ["sad", "fear"]:
+            st.warning("You seem stressed 😟")
+        elif dominant == "angry":
+            st.warning("You look angry 😡")
+        elif dominant == "happy":
+            st.success("You look happy 😄")
+        else:
+            st.info("You look neutral 😐")
+
+        st.markdown("</div>", unsafe_allow_html=True)
